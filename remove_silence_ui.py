@@ -41,7 +41,7 @@ class SilenceRemoverApp(App):
         layout: grid;
         grid-size: 2;
         grid-rows: 2fr auto auto;
-        grid-columns: 2fr 1fr;
+        grid-columns: 1fr 1fr;
         height: 100%;
     }
     
@@ -138,6 +138,13 @@ class SilenceRemoverApp(App):
         content-align: center middle;
     }
     
+    #time-info {
+        width: 100%;
+        height: 2;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    
     #progress-bar {
         width: 100%;
         height: 2;
@@ -198,6 +205,8 @@ class SilenceRemoverApp(App):
         super().__init__(*args, **kwargs)
         self.silence_remover = None
         self.processing = False
+        self.start_time = None
+        self.last_progress = 0
     
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
@@ -257,6 +266,7 @@ class SilenceRemoverApp(App):
             with Container(id="progress-container"):
                 yield Label("Ready to start...", id="progress-label")
                 yield ProgressBar(total=100, id="progress-bar")
+                yield Label("Time: --:--:-- (est. --:--:--)", id="time-info")
         
         yield Footer()
     
@@ -305,9 +315,15 @@ class SilenceRemoverApp(App):
         """Update the progress bar and label."""
         progress_bar = self.query_one("#progress-bar", ProgressBar)
         progress_label = self.query_one("#progress-label", Label)
+        time_info = self.query_one("#time-info", Label)
+        
+        # Initialize start time if this is the first progress update
+        if self.start_time is None and progress > 0:
+            self.start_time = time.time()
         
         # Update progress bar (0-100)
         progress_bar.progress = int(progress * 100)
+        self.last_progress = progress
         
         # Update label with percentage
         percentage = int(progress * 100)
@@ -320,6 +336,29 @@ class SilenceRemoverApp(App):
             progress_label.update(f"{short_message} - {percentage}%")
         else:
             progress_label.update(f"Progress: {percentage}%")
+            
+        # Update time information
+        if self.start_time is not None and progress > 0:
+            # Calculate elapsed time
+            elapsed_seconds = time.time() - self.start_time
+            elapsed_str = self._format_time(elapsed_seconds)
+            
+            # Calculate estimated total time and remaining time
+            if progress > 0.01:  # Avoid division by very small numbers
+                estimated_total = elapsed_seconds / progress
+                remaining_seconds = estimated_total - elapsed_seconds
+                remaining_str = self._format_time(remaining_seconds)
+                time_info.update(f"Elapsed: {elapsed_str} (est. remaining: {remaining_str})")
+            else:
+                time_info.update(f"Elapsed: {elapsed_str} (est. remaining: calculating...)")
+        else:
+            time_info.update("Time: --:--:-- (est. --:--:--)")
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds into HH:MM:SS format."""
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Called when a button is pressed."""
@@ -385,7 +424,9 @@ class SilenceRemoverApp(App):
         start_button.disabled = True
         cancel_button.disabled = False
         
-        # Reset progress
+        # Reset progress and timer
+        self.start_time = None
+        self.last_progress = 0
         self.update_progress(0, "Starting...")
         
         # Create silence remover
@@ -423,6 +464,11 @@ class SilenceRemoverApp(App):
             start_button.disabled = False
             cancel_button.disabled = True
             
+            # Calculate and show total processing time
+            if self.start_time is not None:
+                total_time = time.time() - self.start_time
+                self.add_log(f"Total processing time: {self._format_time(total_time)}")
+            
             if result:
                 self.add_log("Silence removal completed successfully!")
                 if self.silence_remover and self.silence_remover.output_file:
@@ -444,7 +490,12 @@ class SilenceRemoverApp(App):
             self.processing = False
             self.query_one("#start-button", Button).disabled = False
             self.query_one("#cancel-button", Button).disabled = True
+            
+            # Reset timer and progress
+            self.start_time = None
+            self.last_progress = 0
             self.update_progress(0, "Cancelled")
+            self.query_one("#time-info", Label).update("Time: --:--:-- (est. --:--:--)")
     
     def action_quit(self) -> None:
         """Quit the application."""
