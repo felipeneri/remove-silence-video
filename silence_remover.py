@@ -15,7 +15,9 @@ class SilenceRemover:
     
     def __init__(self, input_file: str, output_file: Optional[str] = None, 
                  silence_threshold: str = "-30dB", min_silence_duration: float = 1.0,
-                 padding_ms: int = 200, on_progress: Optional[Callable] = None, 
+                 padding_ms: int = 200, codec: Optional[str] = None, 
+                 bitrate: Optional[str] = None, quality: Optional[int] = None,
+                 preset: Optional[str] = None, on_progress: Optional[Callable] = None, 
                  on_log: Optional[Callable] = None):
         """
         Initialize the silence remover
@@ -26,6 +28,10 @@ class SilenceRemover:
             silence_threshold: The threshold below which audio is considered silence (in dB)
             min_silence_duration: Maximum silence duration to keep in seconds
             padding_ms: Amount of milliseconds to keep before and after non-silent parts
+            codec: Specific video codec to use (None for auto-detection)
+            bitrate: Video bitrate (e.g., "5M" for 5 megabits)
+            quality: CRF value for quality (lower is better quality, 18-28 is typical)
+            preset: Encoding preset (e.g., "medium", "fast", "slow")
             on_progress: Callback for progress updates
             on_log: Callback for log messages
         """
@@ -33,13 +39,18 @@ class SilenceRemover:
         
         if output_file is None:
             filename = os.path.basename(input_file)
-            self.output_file = "no_silence_" + filename
+            base_name, ext = os.path.splitext(filename)
+            self.output_file = f"{base_name}_silence{ext}"
         else:
             self.output_file = output_file
             
         self.silence_threshold = silence_threshold
         self.min_silence_duration = min_silence_duration
         self.padding_ms = padding_ms
+        self.codec = codec
+        self.bitrate = bitrate
+        self.quality = quality
+        self.preset = preset
         self.temp_dir = None
         self.on_progress = on_progress
         self.on_log = on_log
@@ -263,29 +274,8 @@ class SilenceRemover:
                 '-map', '[a]'
             ]
             
-            # Add encoding parameters based on hardware acceleration
-            if use_hardware_accel == 'videotoolbox':
-                cmd.extend([
-                    '-c:v', 'h264_videotoolbox',
-                    '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac',
-                    '-b:a', '128k'
-                ])
-            elif use_hardware_accel == 'nvenc':
-                cmd.extend([
-                    '-c:v', 'h264_nvenc',
-                    '-preset', 'p1',
-                    '-c:a', 'aac',
-                    '-b:a', '128k'
-                ])
-            else:
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',  # Use fastest preset for encoding speed
-                    '-crf', '23',            # Balance quality and size
-                    '-c:a', 'aac',
-                    '-b:a', '128k'
-                ])
+            # Add encoding parameters based on user settings and hardware acceleration
+            self._add_encoding_options(cmd, use_hardware_accel)
             
             cmd.append(self.output_file)
             
@@ -359,6 +349,67 @@ class SilenceRemover:
             self.log_message(f"Error during video processing: {e}", "error")
             return False
     
+    def _add_encoding_options(self, cmd, use_hardware_accel):
+        """Add encoding options to the FFmpeg command based on hardware acceleration and user settings"""
+        # Use user specified codec if provided
+        if self.codec:
+            cmd.extend(['-c:v', self.codec])
+        # Otherwise use hardware acceleration if available
+        elif use_hardware_accel == 'videotoolbox':
+            cmd.extend([
+                '-c:v', 'h264_videotoolbox',
+                '-allow_sw', '1',  # Allow software encoding if hardware fails
+                '-profile:v', 'high',  # Use high profile for better quality/size ratio
+                '-pix_fmt', 'yuv420p'
+            ])
+            
+            # Add bitrate control if specified
+            if self.bitrate:
+                cmd.extend(['-b:v', self.bitrate])
+            else:
+                # Default to reasonable bitrate for high quality, smaller size
+                cmd.extend(['-b:v', '5M'])
+                
+        elif use_hardware_accel == 'nvenc':
+            cmd.extend([
+                '-c:v', 'h264_nvenc',
+                '-profile:v', 'high',
+                '-preset', self.preset if self.preset else 'p2'  # Balance between quality and speed
+            ])
+            
+            # Add bitrate or quality control
+            if self.bitrate:
+                cmd.extend(['-b:v', self.bitrate])
+            elif self.quality:
+                # For NVENC, use -cq parameter for quality
+                cmd.extend(['-cq', str(self.quality)])
+            else:
+                cmd.extend(['-cq', '20'])  # Default quality setting
+                
+        else:
+            # Software encoding with libx264
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-profile:v', 'high',
+                '-preset', self.preset if self.preset else 'medium'  # Balance between speed and compression
+            ])
+            
+            # Add bitrate or quality control
+            if self.bitrate:
+                cmd.extend(['-b:v', self.bitrate])
+            elif self.quality:
+                cmd.extend(['-crf', str(self.quality)])
+            else:
+                cmd.extend(['-crf', '23'])  # Default quality - good balance
+        
+        # Audio encoding settings (always needed)
+        cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', '128k'
+        ])
+        
+        return cmd
+    
     def _process_video_in_chunks(self, segments: List[Tuple[float, float]]) -> bool:
         """Process the video in chunks to avoid filter_complex limitations"""
         self.log_message(f"Processing {len(segments)} segments in chunks...")
@@ -367,6 +418,9 @@ class SilenceRemover:
         temp_files = []
         chunk_size = 50  # Number of segments per chunk
         total_chunks = (len(segments) + chunk_size - 1) // chunk_size
+        
+        # Get hardware acceleration 
+        use_hardware_accel = self.check_hardware_acceleration()
         
         for chunk_idx in range(0, len(segments), chunk_size):
             if self.cancelled:
@@ -391,13 +445,13 @@ class SilenceRemover:
                     '-i', self.input_file,
                     '-filter_complex', filter_complex,
                     '-map', '[v]',
-                    '-map', '[a]',
-                    '-c:v', 'h264_videotoolbox',  # Use hardware acceleration
-                    '-c:a', 'aac',  # Re-encode audio for compatibility
-                    '-b:a', '128k',
-                    '-pix_fmt', 'yuv420p',
-                    chunk_file
+                    '-map', '[a]'
                 ]
+                
+                # Add encoding parameters
+                self._add_encoding_options(cmd, use_hardware_accel)
+                
+                cmd.append(chunk_file)
                 
                 self.process = subprocess.Popen(
                     cmd,

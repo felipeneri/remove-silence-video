@@ -120,7 +120,8 @@ class SilenceRemoverApp(App):
         padding: 0 0 1 0;
     }
     
-    #threshold-container, #duration-container, #padding-container {
+    #threshold-container, #duration-container, #padding-container,
+    #codec-container, #bitrate-container, #quality-container, #preset-container {
         width: 100%;
         layout: horizontal;
     }
@@ -167,6 +168,13 @@ class SilenceRemoverApp(App):
         overflow-x: auto;
         text-wrap: wrap;
     }
+    
+    #compression-title {
+        content-align: center middle;
+        text-style: bold;
+        margin-top: 1;
+        height: 2;
+    }
     """
     
     BINDINGS = [
@@ -181,6 +189,10 @@ class SilenceRemoverApp(App):
     threshold = "-30dB"
     duration = "1.0"
     padding = "200"
+    codec = ""
+    bitrate = ""
+    quality = ""
+    preset = ""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -214,6 +226,24 @@ class SilenceRemoverApp(App):
                 with Horizontal(classes="input-row", id="padding-container"):
                     yield Label("Padding:", classes="input-label")
                     yield Input(value=self.padding, placeholder="200 milliseconds", id="padding", classes="input-field")
+                
+                yield Static("Compression Settings", id="compression-title")
+                
+                with Horizontal(classes="input-row", id="codec-container"):
+                    yield Label("Video Codec:", classes="input-label")
+                    yield Input(value=self.codec, placeholder="libx264, h264_videotoolbox", id="codec", classes="input-field")
+                
+                with Horizontal(classes="input-row", id="bitrate-container"):
+                    yield Label("Bitrate:", classes="input-label")
+                    yield Input(value=self.bitrate, placeholder="5M, 500k", id="bitrate", classes="input-field")
+                
+                with Horizontal(classes="input-row", id="quality-container"):
+                    yield Label("Quality (CRF):", classes="input-label")
+                    yield Input(value=self.quality, placeholder="23 (18-28, lower is better)", id="quality", classes="input-field")
+                
+                with Horizontal(classes="input-row", id="preset-container"):
+                    yield Label("Encoding Preset:", classes="input-label")
+                    yield Input(value=self.preset, placeholder="medium, fast, slow", id="preset", classes="input-field")
             
             with Container(id="log-container"):
                 yield Static("Welcome to Video Silence Remover", id="log-title")
@@ -235,6 +265,7 @@ class SilenceRemoverApp(App):
         self.title = "Video Silence Remover"
         self.add_log("Welcome to Video Silence Remover")
         self.add_log("Enter the path to a video file and click 'Start Processing'")
+        self.add_log("TIP: Use compression settings for smaller output files.")
     
     def add_log(self, message: str, level: str = "info") -> None:
         """Add a message to the log viewer."""
@@ -309,6 +340,12 @@ class SilenceRemoverApp(App):
         duration = self.query_one("#duration", Input).value
         padding = self.query_one("#padding", Input).value
         
+        # Get compression values
+        codec = self.query_one("#codec", Input).value
+        bitrate = self.query_one("#bitrate", Input).value
+        quality = self.query_one("#quality", Input).value
+        preset = self.query_one("#preset", Input).value
+        
         # Validate input
         if not input_file:
             self.add_log("Please enter an input file path", "error")
@@ -330,6 +367,17 @@ class SilenceRemoverApp(App):
             self.add_log(f"Invalid padding value: {padding}", "error")
             return
         
+        # Validate quality if provided
+        if quality:
+            try:
+                quality = int(quality)
+                if quality < 0:
+                    self.add_log(f"Quality value must be positive: {quality}", "error")
+                    return
+            except ValueError:
+                self.add_log(f"Invalid quality value: {quality}", "error")
+                return
+        
         # Update UI
         self.processing = True
         start_button = self.query_one("#start-button", Button)
@@ -347,6 +395,10 @@ class SilenceRemoverApp(App):
             silence_threshold=threshold,
             min_silence_duration=duration,
             padding_ms=padding,
+            codec=codec,
+            bitrate=bitrate,
+            quality=quality,
+            preset=preset,
             on_progress=self.update_progress,
             on_log=self.add_log
         )
@@ -354,6 +406,16 @@ class SilenceRemoverApp(App):
         # Start processing in a worker thread
         self.add_log(f"Starting silence removal for {input_file}")
         self.add_log(f"Parameters: threshold={threshold}, max_silence={duration}s, padding={padding}ms")
+        
+        # Log compression settings if provided
+        if codec:
+            self.add_log(f"Using codec: {codec}")
+        if bitrate:
+            self.add_log(f"Using bitrate: {bitrate}")
+        if quality:
+            self.add_log(f"Using quality setting: {quality}")
+        if preset:
+            self.add_log(f"Using preset: {preset}")
         
         def process_complete(worker) -> None:
             result = worker.result
@@ -400,6 +462,10 @@ def main():
                         help="Maximum silence duration to keep in seconds (default: 1.0)")
     parser.add_argument("--padding", type=int, default=200,
                         help="Padding in milliseconds before and after non-silent parts (default: 200ms)")
+    parser.add_argument("--codec", help="Specific video codec to use (e.g., h264_videotoolbox, libx264)")
+    parser.add_argument("--bitrate", help="Video bitrate (e.g., 5M for 5 megabits/s)")
+    parser.add_argument("--quality", help="Quality setting (CRF, lower is better quality, 18-28 is typical)")
+    parser.add_argument("--preset", help="Encoding preset (e.g., medium, fast, slow for libx264)")
     
     args = parser.parse_args()
     
@@ -417,6 +483,14 @@ def main():
         app.duration = str(args.duration)
     if args.padding:
         app.padding = str(args.padding)
+    if args.codec:
+        app.codec = args.codec
+    if args.bitrate:
+        app.bitrate = args.bitrate
+    if args.quality:
+        app.quality = args.quality
+    if args.preset:
+        app.preset = args.preset
     
     app.run()
 

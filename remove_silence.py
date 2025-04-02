@@ -8,7 +8,8 @@ import shutil
 import json
 import re
 
-def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_silence_duration=1, padding_ms=200):
+def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_silence_duration=1, padding_ms=200, 
+                  codec=None, bitrate=None, quality=None, preset=None):
     """
     Remove silence from a video file using FFmpeg.
     
@@ -18,6 +19,10 @@ def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_
         silence_threshold: The threshold below which audio is considered silence (in dB)
         min_silence_duration: Maximum silence duration to keep in seconds
         padding_ms: Amount of milliseconds to keep before and after non-silent parts
+        codec: Specific video codec to use (None for auto-detection)
+        bitrate: Video bitrate (e.g., "5M" for 5 megabits)
+        quality: CRF value for quality (lower is better quality, 18-28 is typical)
+        preset: Encoding preset (e.g., "medium", "fast", "veryfast")
     """
     print(f"Step 1: Checking if input file exists...")
     if not os.path.exists(input_file):
@@ -29,7 +34,8 @@ def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_
     
     if output_file is None:
         filename = os.path.basename(input_file)
-        output_file = "no_silence_" + filename
+        base_name, ext = os.path.splitext(filename)
+        output_file = f"{base_name}_silence{ext}"
     
     # Create temporary directory
     temp_dir = tempfile.mkdtemp()
@@ -142,6 +148,9 @@ def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_
             temp_files = []
             chunk_size = 50  # Number of segments per chunk
             
+            # Check for available hardware acceleration
+            use_hardware_accel = check_hardware_acceleration()
+            
             for chunk_idx in range(0, len(segments), chunk_size):
                 chunk_segments = segments[chunk_idx:chunk_idx + chunk_size]
                 chunk_file = os.path.join(temp_dir, f"chunk_{chunk_idx}.mp4")
@@ -158,13 +167,13 @@ def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_
                     '-i', input_file,
                     '-filter_complex', filter_complex,
                     '-map', '[v]',
-                    '-map', '[a]',
-                    '-c:v', 'h264_videotoolbox',  # Use hardware acceleration
-                    '-c:a', 'aac',  # Re-encode audio for compatibility
-                    '-b:a', '128k',
-                    '-pix_fmt', 'yuv420p',
-                    chunk_file
+                    '-map', '[a]'
                 ]
+                
+                # Add encoding parameters based on settings and hardware acceleration
+                add_encoding_options(cmd, use_hardware_accel, codec, bitrate, quality, preset)
+                
+                cmd.append(chunk_file)
                 
                 subprocess.run(cmd, check=True)
                 print(f"Chunk {chunk_idx//chunk_size + 1} completed.")
@@ -210,29 +219,8 @@ def remove_silence(input_file, output_file=None, silence_threshold="-30dB", min_
                     '-map', '[a]'
                 ]
                 
-                # Add encoding parameters based on hardware acceleration
-                if use_hardware_accel == 'videotoolbox':
-                    cmd.extend([
-                        '-c:v', 'h264_videotoolbox',
-                        '-pix_fmt', 'yuv420p',
-                        '-c:a', 'aac',
-                        '-b:a', '128k'
-                    ])
-                elif use_hardware_accel == 'nvenc':
-                    cmd.extend([
-                        '-c:v', 'h264_nvenc',
-                        '-preset', 'p1',
-                        '-c:a', 'aac',
-                        '-b:a', '128k'
-                    ])
-                else:
-                    cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',  # Use fastest preset for encoding speed
-                        '-crf', '23',            # Balance quality and size
-                        '-c:a', 'aac',
-                        '-b:a', '128k'
-                    ])
+                # Add encoding parameters based on hardware acceleration and user settings
+                add_encoding_options(cmd, use_hardware_accel, codec, bitrate, quality, preset)
                 
                 cmd.append(output_file)
                 
@@ -304,6 +292,67 @@ def create_filter_complex(segments):
     
     return trim_str + concat_str
 
+def add_encoding_options(cmd, use_hardware_accel, codec, bitrate, quality, preset):
+    """Add encoding options to the FFmpeg command based on hardware acceleration and user settings."""
+    # Use user specified codec if provided
+    if codec:
+        cmd.extend(['-c:v', codec])
+    # Otherwise use hardware acceleration if available
+    elif use_hardware_accel == 'videotoolbox':
+        cmd.extend([
+            '-c:v', 'h264_videotoolbox',
+            '-allow_sw', '1',  # Allow software encoding if hardware fails
+            '-profile:v', 'high',  # Use high profile for better quality/size ratio
+            '-pix_fmt', 'yuv420p'
+        ])
+        
+        # Add bitrate control if specified
+        if bitrate:
+            cmd.extend(['-b:v', bitrate])
+        else:
+            # Default to reasonable bitrate for high quality, smaller size
+            cmd.extend(['-b:v', '5M'])
+            
+    elif use_hardware_accel == 'nvenc':
+        cmd.extend([
+            '-c:v', 'h264_nvenc',
+            '-profile:v', 'high',
+            '-preset', preset if preset else 'p2'  # Balance between quality and speed
+        ])
+        
+        # Add bitrate or quality control
+        if bitrate:
+            cmd.extend(['-b:v', bitrate])
+        elif quality:
+            # For NVENC, use -cq parameter for quality
+            cmd.extend(['-cq', str(quality)])
+        else:
+            cmd.extend(['-cq', '20'])  # Default quality setting
+            
+    else:
+        # Software encoding with libx264
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-profile:v', 'high',
+            '-preset', preset if preset else 'medium'  # Balance between speed and compression
+        ])
+        
+        # Add bitrate or quality control
+        if bitrate:
+            cmd.extend(['-b:v', bitrate])
+        elif quality:
+            cmd.extend(['-crf', str(quality)])
+        else:
+            cmd.extend(['-crf', '23'])  # Default quality - good balance
+    
+    # Audio encoding settings (always needed)
+    cmd.extend([
+        '-c:a', 'aac',
+        '-b:a', '128k'
+    ])
+    
+    return cmd
+
 def check_hardware_acceleration():
     """Check for available hardware acceleration options."""
     try:
@@ -313,6 +362,8 @@ def check_hardware_acceleration():
             stderr=subprocess.STDOUT, 
             universal_newlines=True
         )
+        
+        print(f"Available hardware acceleration options: {hwaccel_output}")
         
         if 'videotoolbox' in hwaccel_output.lower():
             print("Using macOS VideoToolbox hardware acceleration")
@@ -338,6 +389,10 @@ def main():
                        help='Padding in milliseconds before and after non-silent parts (default: 200ms)')
     parser.add_argument('--verbose', action='store_true',
                        help='Show more detailed output')
+    parser.add_argument('--codec', help='Specific video codec to use (e.g., h264_videotoolbox, libx264, h264_nvenc)')
+    parser.add_argument('--bitrate', help='Video bitrate (e.g., 5M for 5 megabits/s)')
+    parser.add_argument('--quality', type=int, help='Quality setting (CRF, lower is better quality, 18-28 is typical)')
+    parser.add_argument('--preset', help='Encoding preset (e.g., medium, fast, slow for libx264)')
     
     args = parser.parse_args()
     
@@ -345,12 +400,25 @@ def main():
     print(f"Processing file: {args.input_file}")
     print(f"Parameters: threshold={args.threshold}, max_silence={args.duration}s, padding={args.padding}ms")
     
+    if args.codec:
+        print(f"Using codec: {args.codec}")
+    if args.bitrate:
+        print(f"Using bitrate: {args.bitrate}")
+    if args.quality:
+        print(f"Using quality setting: {args.quality}")
+    if args.preset:
+        print(f"Using preset: {args.preset}")
+    
     success = remove_silence(
         args.input_file, 
         args.output, 
         args.threshold, 
         args.duration,
-        args.padding
+        args.padding,
+        args.codec,
+        args.bitrate,
+        args.quality,
+        args.preset
     )
     
     if success:
