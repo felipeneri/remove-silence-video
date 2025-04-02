@@ -5,6 +5,7 @@ import tempfile
 import shutil
 import re
 import logging
+from datetime import timedelta
 from typing import List, Tuple, Optional, Callable
 
 # Set up logging
@@ -56,6 +57,16 @@ class SilenceRemover:
         self.on_log = on_log
         self.process = None
         self.cancelled = False
+    
+    def _format_duration(self, seconds):
+        """Format seconds into HH:MM:SS.ms format"""
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        if hours > 0:
+            return f"{int(hours)}:{int(minutes):02}:{seconds:06.3f}"
+        else:
+            return f"{int(minutes)}:{seconds:06.3f}"
     
     def log_message(self, message: str, level: str = "info"):
         """Log a message to the console and to the callback if provided"""
@@ -547,6 +558,7 @@ class SilenceRemover:
     def remove_silence(self) -> bool:
         """Main method to remove silence from a video"""
         self.cancelled = False
+        total_start_time = time.time()
         
         try:
             # Create a temporary directory for intermediate files
@@ -555,6 +567,24 @@ class SilenceRemover:
             # Step 1: Check if input file exists
             if not self.check_input_file():
                 return False
+            
+            # Get input file size and format information
+            input_file_size = os.path.getsize(self.input_file)
+            input_file_size_mb = input_file_size / (1024*1024)
+            self.log_message(f"Original file size: {input_file_size_mb:.2f} MB ({input_file_size:,} bytes)")
+            
+            # Get input file duration and resolution
+            input_info = self._get_file_info(self.input_file)
+            if input_info:
+                duration_sec = input_info.get("duration", 0)
+                formatted_duration = self._format_duration(duration_sec)
+                self.log_message(f"Original file duration: {formatted_duration}")
+                
+                # Add resolution if available
+                width = input_info.get("width")
+                height = input_info.get("height")
+                if width and height:
+                    self.log_message(f"Original resolution: {width}x{height}")
             
             self.update_progress(0.1, "Detecting silence")
             
@@ -586,7 +616,58 @@ class SilenceRemover:
             self.update_progress(0.5, "Processing video")
             
             # Step 6: Process the video
-            return self.process_video(segments)
+            result = self.process_video(segments)
+            
+            # Step 7: Final report if successful
+            if result and os.path.exists(self.output_file) and not self.cancelled:
+                total_duration = time.time() - total_start_time
+                formatted_total_time = self._format_duration(total_duration)
+                
+                # Get output file info
+                output_file_size = os.path.getsize(self.output_file)
+                output_file_size_mb = output_file_size / (1024*1024)
+                
+                # Get output file duration and resolution
+                output_info = self._get_file_info(self.output_file)
+                if output_info:
+                    output_duration_sec = output_info.get("duration", 0)
+                    output_formatted_duration = self._format_duration(output_duration_sec)
+                    
+                    # Calculate time saved
+                    time_saved = duration - output_duration_sec
+                    percent_saved = (time_saved / duration) * 100 if duration > 0 else 0
+                    
+                    # Calculate space difference
+                    space_diff = input_file_size - output_file_size
+                    percent_size_diff = (space_diff / input_file_size) * 100 if input_file_size > 0 else 0
+                    
+                    # Display summary
+                    self.log_message("\n=== Processing Summary ===")
+                    self.log_message(f"Total processing time: {formatted_total_time}")
+                    self.log_message(f"Original file: {os.path.basename(self.input_file)}")
+                    self.log_message(f"  - Size: {input_file_size_mb:.2f} MB ({input_file_size:,} bytes)")
+                    self.log_message(f"  - Duration: {self._format_duration(duration)}")
+                    
+                    self.log_message(f"Output file: {os.path.basename(self.output_file)}")
+                    self.log_message(f"  - Size: {output_file_size_mb:.2f} MB ({output_file_size:,} bytes)")
+                    self.log_message(f"  - Duration: {output_formatted_duration}")
+                    
+                    if time_saved > 0:
+                        self.log_message(f"Time removed: {self._format_duration(time_saved)} ({percent_saved:.1f}%)")
+                    
+                    if space_diff < 0:
+                        # Output is larger than input
+                        self.log_message(f"File size increased by: {abs(space_diff)/(1024*1024):.2f} MB ({abs(percent_size_diff):.1f}%)")
+                    else:
+                        # Output is smaller than input
+                        self.log_message(f"File size reduced by: {space_diff/(1024*1024):.2f} MB ({percent_size_diff:.1f}%)")
+                    
+                    # Show codec info
+                    video_codec = output_info.get("video_codec", "unknown")
+                    audio_codec = output_info.get("audio_codec", "unknown")
+                    self.log_message(f"Video codec: {video_codec}, Audio codec: {audio_codec}")
+                
+            return result
         except Exception as e:
             self.log_message(f"Unexpected error: {e}", "error")
             import traceback
@@ -599,4 +680,59 @@ class SilenceRemover:
             
             # Ensure the progress is complete
             if not self.cancelled:
-                self.update_progress(1.0, "Complete") 
+                self.update_progress(1.0, "Complete")
+    
+    def _get_file_info(self, file_path):
+        """Get file information using ffprobe"""
+        try:
+            # Get file duration
+            duration_output = subprocess.check_output([
+                'ffprobe', 
+                '-v', 'error', 
+                '-show_entries', 'format=duration', 
+                '-of', 'default=noprint_wrappers=1:nokey=1', 
+                file_path
+            ], universal_newlines=True).strip()
+            
+            # Get video stream information
+            video_info = subprocess.check_output([
+                'ffprobe', 
+                '-v', 'error', 
+                '-select_streams', 'v:0', 
+                '-show_entries', 'stream=width,height,codec_name,bit_rate', 
+                '-of', 'default=noprint_wrappers=1:nokey=1', 
+                file_path
+            ], universal_newlines=True).strip().split('\n')
+            
+            # Get audio stream information
+            audio_info = subprocess.check_output([
+                'ffprobe', 
+                '-v', 'error', 
+                '-select_streams', 'a:0', 
+                '-show_entries', 'stream=codec_name,bit_rate', 
+                '-of', 'default=noprint_wrappers=1:nokey=1', 
+                file_path
+            ], universal_newlines=True).strip().split('\n')
+            
+            result = {
+                "duration": float(duration_output) if duration_output else 0
+            }
+            
+            # Extract video information
+            if len(video_info) >= 3:
+                result["width"] = int(video_info[0]) if video_info[0].isdigit() else None
+                result["height"] = int(video_info[1]) if video_info[1].isdigit() else None
+                result["video_codec"] = video_info[2]
+                if len(video_info) > 3 and video_info[3].isdigit():
+                    result["video_bitrate"] = int(video_info[3])
+            
+            # Extract audio information
+            if len(audio_info) >= 1:
+                result["audio_codec"] = audio_info[0]
+                if len(audio_info) > 1 and audio_info[1].isdigit():
+                    result["audio_bitrate"] = int(audio_info[1])
+            
+            return result
+        except (ValueError, subprocess.CalledProcessError, IndexError) as e:
+            self.log_message(f"Error getting file info: {e}", "error")
+            return None 
